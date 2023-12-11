@@ -1,0 +1,2114 @@
+---
+title: "Trust scale text analysis"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+## Introduction
+Trust has emerged as a prevalant construct to desribe relationships between people and between people and technology. 
+
+Across these domains many different subjective rating scales are used to measure trust. The degree to which these scales differ has not been systematically explored, nor has the topic distribution of these scales. The goal of the paper is to collect subjective rating scales of trust and use text analysis to identify the similarities and differences between them and the themes across them.
+
+
+This paper fills this gap in three steps. First, we will need to conduct a brief literature review to gather the existing surveys and scales. Second, we will apply text analysis techniques to quantify the relationships between words used the scales, the items that comprise the scales, and the overall scales. These relationships can be quantified using GLOVEC and Word2Vec vector representations of the words used in the items. These vector representations define words using a vector of 50 to 300 numbers.  We reduce the dimensionality of the resulting dataset using UMAP and visualize it in a 2D plot that shows which terms and items are close to each other. This semantic space provides a map of how trust has been operationalized.  
+
+A recent paper used a similar technique to integrate research papers in material science:
+https://www.nature.com/articles/s41586-019-1335-8
+"Unsupervised word embeddings capture latent knowledge from materials science literature"
+
+
+Our goal is to map the semantic space of subjective ratings of trust  to guide researchers towards trust scales that might be best suited to measuring the aspects of trust that are relevant to their particular study. 
+
+We also hope to be able to answer questions such as:
+• Do some scales substantially different areas of the semantic space of trust.
+• How to develop a questionnaire that captures the information in other questionnaires?
+* What short-form (3-item) scale would be most promising
+* What long-form scale is most comprehensive
+
+
+```{r, configure-workspace}
+library(tidyverse)
+library(tidytext)
+library(devtools)
+library(umap)
+library(ggiraph)
+library(ggrepel)
+#install.packages("flextable")
+library(remotes) # to install from github
+install_github("juliasilge/tidylo")
+install_github("bmschmidt/wordVectors")
+library(wordVectors)
+library(ggforce)
+#library(tidylo) # for log odds rather than tf_idf
+library(flextable) # for tables for MS Word
+library(viridis) 
+library(ggalt)
+library(reshape)
+library(text2vec)
+library(rlang)
+
+
+set.seed(888)
+rm(list = ls(all = TRUE))
+
+
+
+# Set seed for UMAP:
+custom.config = umap.defaults
+custom.config$random_state = 123
+# checkpoint("2020-02-20")
+# 
+# require(fpp)
+# require(checkpoint)
+# require(codetools)
+# dir.create(".checkpoint")
+# checkpoint("2020-02-20",checkpointLocation=getwd())
+```
+
+# Log odds function
+```{r}
+bind_log_odds <- function(tbl, set, feature, n) {
+   set <- rlang::enquo(set)
+    feature <- rlang::enquo(feature)
+    n_col <- rlang::enquo(n)
+    ## groups are preserved but ignored
+    grouping <- group_vars(tbl)
+    tbl <- ungroup(tbl)
+    freq1_df <- dplyr::count(tbl, !!feature, wt = !!n_col)
+    freq1_df <- dplyr::rename(freq1_df, freq1 = n)
+    freq2_df <- dplyr::count(tbl, !!set, wt = !!n_col)
+    freq2_df <- dplyr::rename(freq2_df, freq2 = n)
+    df_joined <- dplyr::left_join(tbl, freq1_df, by = rlang::as_name(feature))
+    df_joined <- mutate(df_joined, freqnotthem = freq1 - !!n_col)
+    df_joined <- mutate(df_joined, total = sum(!!n_col))
+    df_joined <- left_join(df_joined, freq2_df, by = rlang::as_name(set))
+    df_joined <- mutate(df_joined, 
+                        freq2notthem = total - freq2,
+                        l1them = (!!n_col + freq1) / ((total + freq2) - (!!n_col + freq1)),
+                        l2notthem = (freqnotthem + freq1) / ((total + freq2notthem) - (freqnotthem + freq1)),
+                        sigma2 = 1/(!!n_col + freq1) + 1/(freqnotthem + freq1),
+                        log_odds = (log(l1them) - log(l2notthem)) / sqrt(sigma2))
+        
+    tbl$log_odds <- df_joined$log_odds
+    
+    if (!is_empty(grouping))  {
+        tbl <- group_by(tbl, !!sym(grouping))
+        }
+    
+    tbl
+}
+```
+
+
+## Read subjective rating scales of trust
+Each row is one item from one scale. 
+XX scales and XX items comprise the corpus
+
+```{r, read-scales}
+## This is the old dataset with 28 scales
+#trustscale.df = read_csv(file = "trust_scales.csv")
+
+library(readxl)
+trustscale.df <- read_excel("TrustScales0523.xlsx")
+#View(TrustScales0921)
+## This is the new dataset with 38 scales
+#trustscale.df = read.csv(file = "TrustScales0921.csv", fileEncoding="UTF-8-BOM", quote = "")
+
+names(trustscale.df)[6] = "item_category"
+names(trustscale.df)[7] = "scale_category"
+
+
+## Change numeric variables to factors, such as paper_id and item_number
+
+trustscale.df = trustscale.df %>% select(-contains("X"))
+trustscale.df$item_id = as.factor(paste(trustscale.df$paper_id, trustscale.df$item_number, sep = "."))
+trustscale.df$paper_id = as.factor(trustscale.df$paper_id)
+trustscale.df$item_number = as.factor(trustscale.df$item_number)
+
+trustscale.df = trustscale.df %>%
+  group_by(paper) %>% 
+  mutate(total_items = n()) %>% 
+  ungroup()
+
+trustscale.df = trustscale.df %>% separate(paper, "author_date", remove = FALSE, sep = "[)].")
+  
+trustscale.df$author_date = paste0(trustscale.df$author_date, ")")
+
+trustscale.df$author_date = str_replace_all(trustscale.df$author_date, pattern = "([A-Z][.])", "")
+trustscale.df$author_date = str_replace_all(trustscale.df$author_date, pattern = "([   ])", "")
+trustscale.df$author_date = str_replace_all(trustscale.df$author_date, pattern = ",[(]", " (")
+trustscale.df$author_date = str_replace_all(trustscale.df$author_date, pattern = ",,", ", ")
+trustscale.df$author_date = str_replace_all(trustscale.df$author_date, pattern = ", &", " & ")
+
+
+## update the categories
+trustscale.df$item_category = str_replace_all(trustscale.df$item_category, "History-based", "History-Based")
+
+saveRDS(trustscale.df, file = "trustscale.df.rds")
+## Plot count of the number of items per scale
+ggplot(trustscale.df, aes(reorder(author_date, total_items))) + 
+  geom_bar() +
+  labs(x = "", y = "Number of items") +
+  coord_flip()
+
+
+## Summary of trust scales using flextable: paper title and number of items
+trust_table <- trustscale.df %>% 
+  group_by(paper) %>%
+  summarize(items = n(), Citation = last(Citation)) %>% 
+  flextable(col_keys = c("paper","items", "Citation"))
+
+trust_table <- trust_table %>%
+  set_header_labels(paper = "Paper", items = "Number of Items", Citation = "Number of Citations" )  %>%
+  padding(padding = 0, part = "all") %>%
+  height_all(height = 0, part = "all") %>%
+  width(width = c(4.5, 1, 1)) %>%
+  theme_vanilla()
+
+
+## Print in notebook and as Word document
+trust_table
+print(trust_table, preview = "docx")
+```
+
+
+
+### Create a table for the paper
+
+```{r}
+paper_table <- trustscale.df %>% 
+  group_by(author_date, scale_category) %>%
+  summarize(items = n(), Citation = last(Citation)) %>% arrange(scale_category, desc(Citation)) %>% 
+  flextable(col_keys = c("author_date","items", "Citation", "scale_category"))
+
+
+paper_table <- paper_table %>%
+  set_header_labels(author_date = "Paper", items = "Number of Items", Citation = "Number of Citations", scale_category = "Category" )  %>%
+  padding(padding = 0, part = "all") %>%
+  height_all(height = 0, part = "all") %>%
+  width(width = c(3, 1, 1,1)) %>%
+  theme_vanilla()
+
+
+## Print in notebook and as Word document
+paper_table
+
+print(paper_table, preview = "docx")
+```
+
+##catgory by year
+```{r}
+trustscales_year.df= trustscale.df %>% distinct(author_date, scale_category) %>% 
+  
+  mutate (year = str_extract(author_date, "\\((.*?)\\)")) %>% 
+  mutate(year =  as.numeric(str_replace_all(year, "\\(|\\)", ""))) %>% 
+  mutate(decade =  cut(year, breaks = seq(1960, 2030, by = 10), labels = FALSE, include.lowest = TRUE) * 10) %>% 
+  mutate(decade = decade + 1960) %>% 
+  group_by(decade, scale_category) %>% 
+  summarise(count = n())
+
+
+```
+
+
+## Create a tidy structure of the scale item words
+This takes each word from each item and places it on a seperate line in a table.
+Each row is one word from each item.
+
+```{r, tidy_text}
+## Use tidytext to tokenize and convert to lower case and remove puctuation
+if (!require("pacman")) install.packages("pacman"); library(pacman)
+p_load_gh('hrbrmstr/pluralize')
+p_load(quanteda)
+
+
+trustscale_word.df = unnest_tokens(trustscale.df, word, item, to_lower = TRUE, drop = TRUE)
+trustscale_word.df = trustscale_word.df %>% mutate(word = singularize(unlist(tokenize(word))))
+## Use tidytext to filter stopwords
+data(stop_words)
+stop_words %>% group_by(lexicon) %>% summarise(n())
+
+#Test different lexcisons
+stop_words = stop_words %>% filter(lexicon == "onix")
+
+#stop_words = stop_words %>% filter(lexicon == "snowball")
+
+#test the other lexicon SMART
+#stop_words = stop_words %>% filter(lexicon == "SMART")
+
+## stop words (i.e. domain specific)
+trustscale_word.df = trustscale_word.df %>%
+  # mutate(word = wordStem(word)) %>% 
+  filter(!word %in% stop_words$word) %>%
+  filter(str_length(word) > 2) %>%
+  filter(!word == "robot") %>%
+  filter(!word == "gripper") %>%
+  filter(!word == "brand") %>%
+  filter(!word == "technology") %>%
+  filter(!word == "automation") %>%
+    filter(!word == "automated") %>%
+  filter(!word == "partner") %>%
+  filter(!word == "awd") %>%
+  filter(!word == "system") %>%
+  filter(!word == "user") %>%
+  filter(!word == "systems") %>%
+  filter(!word == "users") %>%
+  filter(!word == "rev") %>%
+  filter(!word == "excel") %>%
+  filter(!word == "spreadsheet") %>%
+  filter(!word == "product") %>%
+  filter(!word == "products") %>%
+  filter(!word == "tank") %>%
+  filter(!word == "professional") %>%
+  filter(!word == "professionals") %>%
+  filter(!word == "spotting") %>%
+  filter(!word == "things") %>%
+  filter(!word == "100") %>%
+  filter(!word == "people") %>%
+  filter(!word == "management") %>%
+  filter(!word == "adult") %>%
+  filter(!word == "vehicle") %>%
+  filter(!word == "robots") %>%
+  filter(!word == "whom") %>%
+  filter(!word == "basically") %>%
+  filter(!word == "usually") %>%
+  filter(!word == "top") %>%
+  filter(!word == "based") %>%
+  filter(!word == "online") %>%
+  filter(!word == "vendor") %>%
+
+  mutate(word = str_replace(word, "thefunctioning", "functioning")) %>%
+  mutate(word = str_replace(word, "it's", ""))
+
+
+
+trustscale_word.df
+```
+
+
+## Remove the new list of stopping words 
+You can comment this section out for comparisons 
+```{r}
+#load the new list of the stopping words
+stop_words.2 <- read_csv("stop_words.csv")
+
+
+trustscale_word.df = trustscale_word.df %>%
+  filter(!word %in% stop_words.2$stop_word)
+
+
+```
+
+## Load GLOVE embedding data
+
+```{r, load glove pre-trained data}
+## Load pre-trained word vectors
+# For details see https://nlp.stanford.edu/projects/glove/
+
+# glove.mat = read.delim(file = "../Embedding&TrustLexicon/glove/glove.6B.100d.txt",
+#                        row.names = 1, sep = " ", header = FALSE, quote = "")
+# 
+glove.mat = read.delim(file = "glove/glove.6B.100d.txt", row.names = 1, sep = " ", header = FALSE, quote = "")
+
+## Remove commas and convert from text to numeric 
+# Needed because a comma has an embedding and makes reading as a csv file impossible
+glove.df = cbind(dimnames(glove.mat)[1], as_tibble(glove.mat))
+names(glove.df)[1] = "word"
+
+glove.df$word = as.factor(glove.df$word)
+
+glove.df = glove.df %>% gather(factor, value, -word) %>% 
+  mutate(value = str_replace(value, ",", "")) %>% 
+  mutate(value = as.numeric(value)) %>% 
+  spread(factor, value)
+
+```
+
+
+## Map an embedding to each word, item, and scale
+The embedding is a vector of numbers that describe the location of each word in a high dimensional semantic space.
+The GLOVEC embeddings are trained on a large corpus of data and this step links the GLOVE embeddings to the words in the scale items.
+
+For weighting the word embeddings tf_idf is frequently used, but a better approach is using the log odds ratio weighted by an uninformative Dirichlet prior.  The advantage of this approach is  because it considers how often a word occurs across documents rather than how many documents contain the word as is calculated as "idf".
+
+Monroe, B. L., Colaresi, M. P., & Quinn, K. M. (2009). Fightin’ Words: Lexical Feature Selection and Evaluation for Identifying the Content of Political Conflict. Ssrn, (2008), 372–403. https://doi.org/10.1093/pan/mpn018
+
+Figure shows that most words occur very infrequently and that one word makes up 8% of the word occurences.
+
+```{r, word-embedding}
+
+## Calculate frequency
+word_embedding.df = trustscale_word.df %>% 
+  group_by(word) %>% 
+  summarise(tf = n()) %>% 
+  ungroup() %>% 
+  mutate(tpercent = tf/sum(tf))
+
+## Pair embeddings with trust scale words 
+word_embedding.df = inner_join(word_embedding.df, glove.df, by = "word") 
+
+ggplot(word_embedding.df %>% filter(tf > 0), aes(tpercent))+ 
+  geom_histogram() +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Distribution of word frequency occurence (percent)", 
+       y = "Number of words")
+
+```
+
+
+## Estimate item embedding
+```{r, item-embedding}
+
+paper_word_embedding.df = trustscale_word.df %>% 
+  group_by(item_id) %>% count(word, sort = TRUE,.drop = FALSE) %>% 
+   bind_tf_idf( word, item_id,n) %>%  
+   bind_log_odds(word, item_id, n) 
+
+
+## Pair embeddings with trust scale words 
+paper_word_embedding.df = inner_join(paper_word_embedding.df, glove.df, by = "word")  
+
+ggplot(paper_word_embedding.df, aes(tf_idf, log_odds)) +
+  geom_point()
+
+
+## Calculate item embedding
+item_embedding.df = paper_word_embedding.df %>%
+  group_by(item_id) %>% 
+  summarize_at(vars(starts_with('V')), funs(weighted.mean(.,  exp(log_odds)))) %>% 
+  ungroup()
+
+```
+
+
+## Estimate scale embedding 
+```{r, scale-embedding}
+## Calculate scale ebedding
+# scale embedding = tfidfitem weighted average of the words that comprise each scale
+scale_word_embedding.df = trustscale_word.df %>% 
+  count(paper, word, sort = TRUE) %>% 
+  bind_log_odds(word, paper, n) 
+
+scale_word_embedding.df = inner_join(scale_word_embedding.df, glove.df, by = "word") 
+
+## Plot distribution of log odds
+ggplot(scale_word_embedding.df, aes(log_odds))+
+    geom_histogram()
+
+
+
+## Plot most distinguishing terms 
+# Based on Log odds ratio, weighted by uninformative Dirichlet prior 
+# Figure bsased on https://juliasilge.com/blog/introducing-tidylo/
+scale_word_embedding.df %>% 
+    group_by(paper) %>%
+    top_n(7, log_odds) %>%
+    slice(1:7) %>% 
+    ungroup %>%
+    mutate(paper_id = as.factor(paper),
+           word = fct_reorder(word, log_odds)) %>%
+    ggplot(aes(word, log_odds, fill = paper)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~paper, scales = "free_y") +
+    coord_flip() +
+   # scale_y_continuous(expand = c(0,0)) +
+    labs(y = "Log odds ratio, weighted by uninformative Dirichlet prior",
+         x = NULL,
+         title = "What were the most specific terms in each scale?")
+
+
+
+scale_embedding.df = scale_word_embedding.df %>% group_by(paper) %>% 
+  summarize_at(vars(starts_with('V')), funs(weighted.mean(., exp(log_odds))))%>% 
+  ungroup()
+
+```
+
+
+
+## Use non-linear dimensionality reduction to create a visual map of the semantic space of trust scale items
+Each point in this space represents one word. The size the the points shows how often a word occurs in all the items across all the scales.
+```{r, plot-umap-trustword}
+
+## Estimate UMAP representation for words
+trust_word.umap = umap(as.matrix(word_embedding.df %>% select(contains("V"))), n_neighbors = 6, custom.config)
+
+trust_word.umap.df = cbind(word_embedding.df %>% select(everything(), -contains("V")), as_tibble(trust_word.umap$layout)) %>% 
+  distinct(word, .keep_all = TRUE)
+
+
+### create a dataset to create highlighted areas in the figure
+#words.areas = data_frame()
+
+highlight_words = trust_word.umap.df %>% 
+  filter(tf>3.5) %>% 
+  filter(word == "dependable" |
+         word == "reliable" |
+         word == "honest"|
+         word == "believe"|
+         word == "expect"|
+         word == "advice"|
+         word == "decisions"|
+         word == "decision"|
+         word == "fair"|
+         word == "welfare"|
+         word == "trust"|
+         word == "secure"|
+         word == "cheat"|
+         word == "sincere"| 
+           word == "knowledge"|
+           word=="experience" |
+           word == "skills")
+         
+
+  trust_word.umap.df = trust_word.umap.df %>% mutate(highlight = ifelse(word %in% highlight_words$word, "yes", "no" ))
+
+## Plot words in UMAP space
+word_umap.plot = ggplot()+
+ # geom_point_interactive(aes(V1, V2, tooltip = word, size = tf), shape = 21)+
+  #geom_point(trust_word.umap.df %>% filter(word == "dependable"),mapping= aes(V1, V2), color = "red", size = 3)+
+  #geom_rect(data=d, mapping=aes(xmin=x1, xmax=x2, ymin=y1, ymax=y2), alpha=0.5) +
+  #geom_encircle(data = highlight_words, mapping = aes(V1, V2), alpha = .5)+
+  #geom_mark_ellipse
+  #geom_mark_rect(data = highlight_words, aes(V1, V2, xx), fill= "light grey" , color = "grey", label.buffer = unit(4, 'mm'), label.minwidth = unit(20, "mm"), label.hjust = 0, label.fontsize = (6), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = .5)+
+  geom_point(trust_word.umap.df %>% filter(tf>3.5 & word != "alway"), mapping=aes(V1, V2), size = .5)+
+  scale_size(limits = c(.1, 20)) +
+  scale_color_grey(start=0.7, end=0.2)+
+  theme_void() +
+  #theme_bw()+
+  theme(legend.position = "none")+
+   geom_text_repel(trust_word.umap.df %>% filter(tf>3.5 & tf < 70 & word != "alway") , mapping=aes(V1, V2, label = word, size = tf, color = highlight), segment.alpha = .6,max.overlaps = Inf) 
+#ggsave(filename= "word_umap.plot_052023.jpeg", plot = word_umap.plot,  width =10, height = 6, units = "in", dpi=400, bg="white")
+
+
+####  In order to highlightt the areas of ceertain themes, I will download this dataset, label the associated theme, re-load it, and highlight based on theme.
+theme.df = trust_word.umap.df %>% filter(tf>3.5)
+
+#write.csv(theme.df,"theme_df.csv", row.names = FALSE)
+
+
+
+# ggsave(filename= "word_umap.plot_updated.jpeg", device="jpeg", plot = word_umap.plot,  width = 8, height = 6, units = "in", dpi=400)
+# ggsave(filename= "word_umap.plot.jpeg", device="jpeg", plot = word_umap.plot,  width = 8, height = 6, units = "in", dpi=400)
+#ggsave(filename= "word_umap.plot.pdf", plot = word_umap.plot,  width = 7, height = 5, units = "in", dpi=400)
+words_themes = read.csv("theme_df_manualUpdated2.csv")
+words_themes=words_themes %>% mutate(highlight = ifelse(word %in% highlight_words$word, "yes", "no" ))
+words_themes=words_themes %>% mutate(word = ifelse(word == "decisions", "decision", word))
+words_themes=words_themes %>% group_by(word) %>% mutate(tf = sum(tf), V1 = mean(V1), V2=mean(V2))
+  
+  
+#mutate(word = ifelse(word == "decisions", "decision", word))
+
+word_umap.plot = ggplot()+
+ # geom_point_interactive(aes(V1, V2, tooltip = word, size = tf), shape = 21)+
+  geom_text_repel(words_themes %>% filter(tf>3.5) %>% group_by(word) %>%  filter(row_number()==1), mapping=aes(V1, V2, label = word, size = tf, color = highlight), segment.alpha = .6,max.overlaps = Inf) +
+  #  geom_text_repel(words_themes %>% filter(tf>3.5& theme == "na"), mapping=aes(V1, V2, label = word, size = tf, color = highlight), segment.alpha = .6,max.overlaps = Inf) +
+  #geom_rect(data=d, mapping=aes(xmin=x1, xmax=x2, ymin=y1, ymax=y2), alpha=0.5) +
+  #geom_encircle(data = highlight_words, mapping = aes(V1, V2), alpha = .5)+
+  #geom_mark_ellipse
+  #geom_mark_rect(data = highlight_words, aes(V1, V2, xx), fill= "light grey" , color = "grey", label.buffer = unit(4, 'mm'), label.minwidth = unit(20, "mm"), label.hjust = 0, label.fontsize = (6), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = .5)+
+  geom_point(words_themes %>% filter(tf>3.5), mapping=aes(V1, V2), size = .5)+
+  scale_size(limits = c(.1, 20)) +
+    scale_color_grey(start=0.7, end=0.2)+
+  theme_void() +
+  #theme_bw()+
+  theme(legend.position = "none")
+
+word_umap.plot
+
+#ggsave(filename= "word_umap.plot_052023_toshowinpaper.jpeg", plot = word_umap.plot,  width =10, height = 6, units = "in", dpi=400, bg="white")
+
+
+
+
+
+
+```
+
+```{r}
+
+library("fpc")
+library(factoextra)
+# Compute DBSCAN using fpc package
+set.seed(123)
+df = words_themes%>% filter(tf>3.5)
+df = df[,4:6]
+db <- fpc::dbscan(df[,1:2], eps =.8, MinPts = 6)
+# Plot DBSCAN results
+plot(db, df[,1:2], main = "DBSCAN", frame = FALSE)
+
+fviz_cluster(db, df[,1:2], stand = FALSE, frame = FALSE, geom = "point")
+print(db)
+
+dbscan::kNNdistplot(df[,1:2], k =  5)
+abline(h = 0.15, lty = 2)
+```
+
+```{r}
+k1 = kmeans(df[,1:2], centers = 4, nstart = 2)
+library(broom)
+fviz_cluster(k1, data = df[,1:2])
+
+```
+```{r}
+words_themes = words_themes %>% mutate(cluster = k1$cluster) 
+#words_themes = words_themes %>% group_by(cluster) %>% mutate(withinnis = rep(k1$withinss, n()))
+
+
+word_cluster.plot = ggplot()+
+ # geom_point_interactive(aes(V1, V2, tooltip = word, size = tf), shape = 21)+
+  geom_text_repel(words_themes %>% filter(tf>3.5), mapping=aes(V1, V2, label = word, size = tf, color = as.factor(cluster)), segment.alpha = .6) +
+  #geom_rect(data=d, mapping=aes(xmin=x1, xmax=x2, ymin=y1, ymax=y2), alpha=0.5) +
+  #geom_encircle(data = highlight_words, mapping = aes(V1, V2), alpha = .5)+
+  #geom_mark_ellipse
+  #geom_mark_rect(data = highlight_words, aes(V1, V2, xx), fill= "light grey" , color = "grey", label.buffer = unit(4, 'mm'), label.minwidth = unit(20, "mm"), label.hjust = 0, label.fontsize = (6), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = .5)+
+  geom_point(trust_word.umap.df %>% filter(tf>3.5), mapping=aes(V1, V2), size = .5)+
+  scale_size(limits = c(.1, 20)) +
+  #theme_void() +
+  theme_bw()+
+  theme(legend.position = "none")
+
+word_cluster.plot
+
+
+```
+```{r}
+set.seed(123)
+
+fviz_nbclust(df[,1:2], kmeans, method = "wss")
+```
+
+
+## Create a lexicon for trust words. Calculate the closest 10 words for each one using cosine similarity
+```{r}
+library(lsa)
+
+
+# word.df = word_category_freq.df %>% 
+#     group_by(scale_category.x) %>%
+#     top_n(10, log_odds) %>% ungroup()
+# 
+# word.df = as.data.frame(word.df)
+# 
+# word.lexicon.df = word_embedding.df %>% 
+#   ungroup() %>% 
+#     top_n(20, tf) 
+# word.lexicon.df = as.data.frame(word.lexicon.df)
+# 
+# glv.df = glove.df
+# glv.df$word = as.character(glv.df$word)
+# glv.cov = cov(glove.df[,-1])
+# 
+# mah.dist <- function(word.df, glv.df, glv.cov, n)  {
+#   ## start a new df based on the length of word.df *3
+#   df <- data.frame(matrix(ncol = 3, nrow = nrow(word.df)*4))
+#   x <- c("word",  "neighbors", "neighbors")
+#   colnames(df) <- x
+#   x = 1
+#   for (i in 1:nrow(word.df))
+#     {
+#     print(i)
+#     df[x:(x+n),1] = rep( word.df[i,2], times = 4)
+#     df[x:(x+n),2] = rep( word.df[i,1], times = 4)
+#     c = glv.df %>% filter(word == word.df[i,2])
+#     c = melt(c, id.vars = "word")
+#     dist = mahalanobis(glv.df[,-1], c[,3], glv.cov, tol=1e-20)
+#     dist = melt(dist)
+#     full.df = cbind(glv.df, dist)
+#     full.df = full.df %>% top_n(-4, value)
+# 
+#       df[x:(x+n),3] = full.df[,1]
+# 
+#     x = x+n+1
+#   #print(x)
+#    print(full.df[,1])
+#     
+#   }
+#   return(df)
+# }
+# 
+# lexicon.df = mah.dist(word.lexicon.df, glv.df, glv.cov, 3)
+
+```
+
+## Map of semantic space of trust rating items
+Each point in this space represents one item
+A simple weighted average works well, but word mover distance retains sequential information of position of words within sentences (http://proceedings.mlr.press/v37/kusnerb15.pdf). An embedding method that uses word mover distance has been developed but not for R (https://www.aclweb.org/anthology/D18-1482)
+
+```{r}
+## Save the item embedding data to do item analysis in a different notebook
+
+#saveRDS(item_embedding.df, "item_embedding.RDS")
+
+```
+
+
+```{r, plot-umap-trustitem}
+## Plot items from scales with factor analysis
+# TODO Fill points based on factorXscale combination
+
+trust_item.umap = umap(as.matrix(item_embedding.df %>% select(starts_with("V"))), n_neighbors = 5, custom.config)
+
+trust_item.umap.df = cbind(item_embedding.df%>% select(everything(), -contains("V")), as_tibble(trust_item.umap$layout)) %>% 
+ #group_by(paper) %>% 
+  distinct(item_id, .keep_all = TRUE) %>% 
+  ungroup() %>% 
+  separate(item_id, into = c("scale", "item"),remove = FALSE)
+
+#TODO join by item_id with trustscale.df for paper id information
+
+## Plot comments in UMAP space
+item_umap.plot = ggplot(trust_item.umap.df)+
+  geom_point_interactive(aes(V1, V2, tooltip = item_id), size= 1, shape = 21)+
+  geom_label_repel(data = trust_item.umap.df %>% sample_n(10), aes(V1, V2, label = item_id))+
+  geom_point(data = trust_item.umap.df %>% filter(scale == "22"), aes(V1, V2), colour = "tomato") +
+  theme_void()
+
+tooltip_css <- "background-color:white;font-style:bold;padding:10px;border-radius:10px 20px 10px 20px"
+ggiraph(code = print(item_umap.plot), tooltip_extra_css = tooltip_css, tooltip_opacity = .9)
+
+item_umap.plot
+
+# ggsave(filename= "item_umap.plot.pdf", plot = item_umap.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+```
+
+## Tune hyper parameters for the items UMAP
+
+
+```{r}
+#n_neighbors = 10
+trust_item.umap_10 = umap(as.matrix(item_embedding.df %>% select(starts_with("V"))), n_neighbors = 10,custom.config)
+
+trust_item.umap_10.df = cbind(item_embedding.df%>% select(everything(), -contains("V")), as_tibble(trust_item.umap_10$layout)) %>% 
+ #group_by(paper) %>% 
+  distinct(item_id, .keep_all = TRUE) %>% 
+  ungroup() %>% 
+  separate(item_id, into = c("scale", "item"),remove = FALSE)
+
+#TODO join by item_id with trustscale.df for paper id information
+
+## Plot comments in UMAP space
+item_umap_10.plot = ggplot(trust_item.umap_10.df)+
+  geom_point_interactive(aes(V1, V2, tooltip = item_id), size= 1, shape = 21)+
+  geom_label_repel(data = trust_item.umap_10.df %>% sample_n(10), aes(V1, V2, label = item_id))+
+  geom_point(data = trust_item.umap_10.df %>% filter(scale == "22"), aes(V1, V2), colour = "tomato") +
+  theme_void()
+
+item_umap_10.plot
+
+# ggsave(filename= "item_umap_10.plot.pdf", plot = item_umap_10.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+```
+
+
+```{r}
+#n_neighbors = 20
+trust_item.umap_40 = umap(as.matrix(item_embedding.df %>% select(starts_with("V"))), n_neighbors = 40, custom.config)
+
+trust_item.umap_40.df = cbind(item_embedding.df%>% select(everything(), -contains("V")), as_tibble(trust_item.umap_40$layout)) %>% 
+ #group_by(paper) %>% 
+  distinct(item_id, .keep_all = TRUE) %>% 
+  ungroup() %>% 
+  separate(item_id, into = c("scale", "item"),remove = FALSE)
+
+#TODO join by item_id with trustscale.df for paper id information
+
+## Plot comments in UMAP space
+item_umap_40.plot = ggplot(trust_item.umap_40.df)+
+  geom_point_interactive(aes(V1, V2, tooltip = item_id), size= 1, shape = 21)+
+  geom_label_repel(data = trust_item.umap_40.df %>% sample_n(10), aes(V1, V2, label = item_id))+
+  geom_point(data = trust_item.umap_40.df %>% filter(scale == "22"), aes(V1, V2), colour = "tomato") +
+  theme_void()
+
+item_umap_40.plot
+
+#ggsave(filename= "item_umap_20.plot.pdf", plot = item_umap_20.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+```
+
+## Complete sensitivity analysis for n_neighbors in items
+```{r}
+temp_1 = trust_item.umap.df %>% mutate(n_neighbors = "5")
+temp_2 = trust_item.umap_10.df %>% mutate(n_neighbors = "10")
+temp_3 = trust_item.umap_20.df %>% mutate(n_neighbors = "20")
+
+sesnitivity_item = rbind(temp_1, temp_2, temp_3)
+rm(list = c("temp_1", "temp_2", "temp_3"))
+
+sesnitivity_item$n_neighbors = factor(sesnitivity_item$n_neighbors, levels = c("5","10","20"))
+
+item_sensitivity.plot = ggplot(sesnitivity_item)+
+  geom_point(aes(V1, V2), size = 2, shape = 21,  fill = "grey35") +
+  facet_grid(.~n_neighbors)+
+  theme_bw()
+
+item_sensitivity.plot
+
+#ggsave(filename= "item_sensitivity.plot.pdf", plot = item_sensitivity.plot,  width = 5, height = 6, units = "in", dpi=400)
+```
+
+## Select the most cited 5, overlay those with the rest
+```{r}
+## Create a data frame of papers & citations
+citations.df = trustscale.df %>% ungroup() %>% select("paper_id", "Citation", "author_date") %>% distinct()
+names(citations.df)[1] = "scale"
+
+trust_item_citation.umap = merge(trust_item.umap_10.df, citations.df, by="scale")
+
+## Create a data frame of categories 
+categories.df = trustscale.df %>% ungroup() %>% select("item_id", "item_category", "scale_category") %>% distinct()
+
+trust_item_citation.umap = merge(trust_item_citation.umap, categories.df, by="item_id")
+
+
+
+#Select the top 5 cited scales to see how their items are distributed in the semantic space
+top_5_cited = trust_item_citation.umap %>% group_by(scale) %>% tally(Citation) %>% top_n(5)
+
+#New dataframe that only includes the top 5 cited scales 
+top_5_cited.df = trust_item_citation.umap[trust_item_citation.umap$scale %in% top_5_cited$scale,]
+
+# a data frame for the items of the 5 most cited scales
+items_5_cited = inner_join(trustscale.df, top_5_cited.df, by="item_id")
+
+item_citation_umap.plot = ggplot()+
+  geom_encircle(data = top_5_cited.df, aes(V1, V2, colour = author_date), expand=0.01, alpha = 1, size = 2)+
+  geom_point(data = top_5_cited.df, aes(V1, V2, colour = author_date),size = 1.5, alpha =1) +
+  geom_point(data = trust_item_citation.umap, aes(V1, V2), shape = 21, size = .7, alpha = .4)+
+  #geom_point(data = trust_item_citation.umap, aes(V1, V2, color =category))+
+  labs(color = "Scale")+
+  scale_color_viridis(discrete = T)+
+  theme_void()
+ # theme(
+ #    legend.position = c(.95, .95),
+ #    legend.justification = c("right", "top"),
+ #    legend.box.just = "right",
+ #    legend.margin = margin(6, 6, 6, 6)
+ #    )
+ item_citation_umap.plot = item_citation_umap.plot + theme(  legend.position = c(.5,.8),  legend.title =  element_blank(), legend.key = element_rect(fill = "white", colour = "black"))
+
+ item_citation_umap.plot = item_citation_umap.plot +guides(colour=guide_legend(nrow=2,byrow=TRUE))
+
+item_citation_umap.plot
+
+# ggsave(filename= "item_citation_umap.plot.pdf", plot = item_citation_umap.plot,  width = 8, height = 6, units = "in", dpi=400)
+
+```
+
+
+```{r}
+#Map colur to the category:
+item_category_umap.plot = ggplot()+
+  #geom_encircle(data = trust_item_citation.umap, aes(V1, V2, colour = scale_category), alpha = 1, size = 2)+
+  geom_point(data = trust_item_citation.umap, aes(V1, V2, colour = scale_category),size = .7, alpha =.6) +
+  geom_point(data = trust_item_citation.umap, aes(V1, V2), shape = 21, size = .7, alpha = .5)+
+  #geom_point(data = trust_item_citation.umap, aes(V1, V2, color =category))+
+  labs(color = "Scale")+
+  scale_color_viridis(discrete = T)+
+  theme_void()
+
+item_category_umap.plot
+#ggsave(filename= "item_category_umap.plot.pdf", plot = item_category_umap.plot,  width = 8, height = 4, units = "in", dpi=400)
+
+```
+
+
+### Do the previous analysis with n_neighbors = 10
+```{r}
+
+
+
+trust_item_citation_40.umap = merge(trust_item.umap_40.df, citations.df, by="scale")
+trust_item_citation_40.umap = merge(trust_item_citation_40.umap, categories.df, by="item_id")
+
+#Select the top 5 cited scales to see how their items are distributed in the semantic space
+top_5_cited = trust_item_citation_40.umap %>% group_by(scale) %>% tally(Citation) %>% top_n(5)
+
+#New dataframe that only includes the top 5 cited scales 
+top_5_cited.df = trust_item_citation_40.umap[trust_item_citation_40.umap$scale %in% top_5_cited$scale,]
+
+# a data frame for the items of the 5 most cited scales
+items_5_cited = inner_join(trustscale.df, top_5_cited.df, by="item_id")
+
+item_citation_40_umap.plot = ggplot()+
+  geom_encircle(data = top_5_cited.df, aes(V1, V2, colour = author_date), expand=0.01, alpha = 1, size = 2)+
+  geom_point(data = top_5_cited.df, aes(V1, V2, colour = author_date),size = 1, alpha =.8) +
+  geom_point(data = trust_item_citation_40.umap, aes(V1, V2), shape = 21, size = .7, alpha = .4)+
+  labs(color = "Scale")+
+  scale_color_viridis(discrete = T)+
+  theme_void()
+
+# item_citation_10_umap.plot = item_citation_10_umap.plot + theme(  legend.position = c(.65,.22),  legend.title =  element_blank(), legend.key = element_rect(fill = "white", colour = "black"))
+# 
+#  item_citation_10_umap.plot = item_citation_10_umap.plot +guides(colour=guide_legend(nrow=3,byrow=TRUE))
+
+item_citation_40_umap.plot 
+
+# ggsave(filename= "item_citation_10_umap.plot.pdf", plot = item_citation_10_umap.plot,  width = 8, height = 6, units = "in", dpi=400)
+
+
+
+```
+
+### Select the one or two most cited scales in each of the domains
+
+```{r}
+
+top_cited_domain.df = trustscale.df %>% ungroup() %>% select("author_date", "scale_category", "Citation") %>% distinct()
+
+top_cited_domain.df = top_cited_domain.df %>% arrange(desc(Citation)) %>% 
+group_by(scale_category) %>% top_n(1)
+
+
+#New dataframe that only includes the top 5 cited scales 
+top_cited_domain.df = trust_item_citation_40.umap[trust_item_citation_40.umap$author_date %in% top_cited_domain.df$author_date,]
+
+# a data frame for the items of the 5 most cited scales
+top_cited_domain.df = inner_join(trustscale.df, top_cited_domain.df, by=c("item_id", "author_date", "scale_category"))
+
+item_cited_domain.plot = ggplot()+
+    geom_point(data = trust_item_citation_40.umap, aes(V1, V2,color = scale_category), size = .8, alpha = .5)+ #scale_color_viridis(discrete = T, guide="none")+
+    scale_color_brewer(palette="Dark2", guide = "none")+
+  geom_mark_rect(data = top_cited_domain.df, aes(V1, V2, group = scale_category , label = scale_category), fill = "light grey" , color = "grey", label.margin = margin(1, 1, 1, 1, "mm"),label.buffer = unit(4, 'mm'),
+  label.minwidth = unit(20, "mm"), label.hjust = 0,
+  label.fontsize = (6), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = .5)+
+  geom_point(data = top_cited_domain.df, aes(V1, V2,fill = scale_category), shape = 21, alpha = .9 ) +
+  scale_fill_brewer(palette="Dark2", name = "Most cited questionnaire", labels = c("Muir & Moray (1996)", "Gefen, Karahanna & Straub (2003)", "Rotter (1967)"))+
+  # scale_fill_viridis(name = "Scale", labels = c("Muir & Moray (1996)", "Gefen, Karahanna & Straub (2003)", "Rotter (1967)"),discrete = T)+
+  theme_void()+
+  theme(legend.position = "bottom", legend.box = "horizontal") 
+
+ 
+item_cited_domain.plot 
+
+
+#ggsave(filename= "item_cited_domain.plot.jpeg", device="jpeg", plot = item_cited_domain.plot,  width = 8, height = 6, units = "in", dpi=400)
+
+#ggsave(filename= "item_cited_domain.plot_updated.jpeg", device="jpeg", plot = item_cited_domain.plot,  width = 8, height = 6, units = "in", dpi=400)
+
+
+
+```
+
+
+## Do clustering for items:
+
+```{r}
+
+trust_item_citation_40.umap = trust_item_citation_40.umap %>% ungroup() %>% mutate(item_category = fct_recode(item_category, "Dispositional" = "dispositional", "Dispositional" = "Dispositional", "History-Based" = "history-based", "History-Based" = "History-Based", "Situational" = "situational", "Situational"="Situational"))
+k1 = kmeans(trust_item_citation_40.umap[,c(4:5)], centers = 3, nstart = 2)
+library(broom)
+fviz_cluster(k1, data = item_embedding.df[,-1])
+print(k1)
+
+fviz_nbclust(item_embedding.df[,-1], kmeans, method = "wss")
+
+p=fviz_cluster(object = k1, # kmeans object
+             data = trust_item_citation_40.umap[,4:5], # data used for clustering
+             ellipse.type = "convex",
+             geom = "point",
+             palette = "jco")
+             #main = "",
+             #ggtheme = theme_minimal(),
+             #geom_label(aes(label = trust_item_citation_40.umap[,8]) )+
+  p+geom_point(data =trust_item_citation_40.umap, aes(x =trust_item_citation_40.umap[,4], y=trust_item_citation_40.umap[,5], color = trust_item_citation_40.umap[,8]))
+  #geom_label_repel(aes(label = trust_item_citation_40.umap[,8]), max.overlaps = 500)
+
+  
+
+# Load required libraries
+library(fpc)  # For the dbscan function
+library(ggplot2)  # For data visualization
+
+
+# DBSCAN clustering
+db <- dbscan(trust_item_citation_40.umap[,c(4:5)], eps = 0.5, MinPts = 10)  # Adjust epsilon (eps) and MinPts as per your data
+
+# Plotting the results
+ggplot(trust_item_citation_40.umap[,c(4:5)], aes(V1, V2, color = factor(db$cluster))) +
+  geom_point() +
+  labs(title = "DBSCAN Clustering") +
+  theme_minimal()
+```
+### Topic modeling
+### https://algoritmaonline.com/topic-modeling-lda/
+```{r}
+
+# Text Processing
+library(tm)
+library(corpus)
+library(textclean)
+library(lubridate)
+library(hunspell)
+library(textmineR)
+library(scales)
+
+# Visualization
+library(ggwordcloud)
+
+# Modeling and Evaluation
+library(randomForest)
+library(e1071)
+library(yardstick)
+```
+
+
+```{r}
+trustscale_TM.df = unnest_tokens(trustscale.df, word, item, to_lower = TRUE, drop = TRUE)
+trustscale_TM.df= trustscale_TM.df[,c(3,13)] %>% count(author_date, word)
+trustscale_TM.df = trustscale_TM.df %>% mutate(word = singularize(unlist(tokenize(word))))
+## Use tidytext to filter stopwords
+data(stop_words)
+stop_words %>% group_by(lexicon) %>% summarise(n())
+
+#Test different lexcisons
+stop_words = stop_words %>% filter(lexicon == "onix")
+
+#stop_words = stop_words %>% filter(lexicon == "snowball")
+
+#test the other lexicon SMART
+#stop_words = stop_words %>% filter(lexicon == "SMART")
+
+## stop words (i.e. domain specific)
+trustscale_TM.df = trustscale_TM.df %>%
+  # mutate(word = wordStem(word)) %>% 
+  filter(!word %in% stop_words$word) %>%
+  filter(str_length(word) > 2) %>%
+  filter(!word == "robot") %>%
+  filter(!word == "gripper") %>%
+  filter(!word == "brand") %>%
+  filter(!word == "technology") %>%
+  filter(!word == "automation") %>%
+    filter(!word == "automated") %>%
+  filter(!word == "partner") %>%
+  filter(!word == "awd") %>%
+  filter(!word == "system") %>%
+  filter(!word == "user") %>%
+  filter(!word == "systems") %>%
+  filter(!word == "users") %>%
+  filter(!word == "rev") %>%
+  filter(!word == "excel") %>%
+  filter(!word == "spreadsheet") %>%
+  filter(!word == "product") %>%
+  filter(!word == "products") %>%
+  filter(!word == "tank") %>%
+  filter(!word == "professional") %>%
+  filter(!word == "professionals") %>%
+  filter(!word == "spotting") %>%
+  filter(!word == "things") %>%
+  filter(!word == "100") %>%
+  filter(!word == "people") %>%
+  filter(!word == "management") %>%
+  filter(!word == "adult") %>%
+  filter(!word == "vehicle") %>%
+  filter(!word == "robots") %>%
+  filter(!word == "whom") %>%
+  filter(!word == "basically") %>%
+  filter(!word == "usually") %>%
+  filter(!word == "top") %>%
+  filter(!word == "based") %>%
+  filter(!word == "online") %>%
+  filter(!word == "vendor") %>%
+
+  mutate(word = str_replace(word, "thefunctioning", "functioning")) %>%
+  mutate(word = str_replace(word, "it's", ""))
+
+trustscale_dtm <- trustscale_TM.df %>% 
+   cast_dtm(document = author_date, term = word, value = n)
+
+inspect(trustscale_dtm)
+```
+
+```{r}
+word_freq <- findFreqTerms(trustscale_dtm, 
+                           lowfreq = 5, 
+                           highfreq = nrow(trustscale_dtm)*0.9
+                           )
+
+trustscale_dtm <- trustscale_dtm[ , word_freq]
+trustscale_dtm
+```
+
+```{r}
+dtm_lda <- Matrix::Matrix(as.matrix(trustscale_dtm), sparse = T)
+
+set.seed(123)
+lda_trustscales <- textmineR::FitLdaModel(dtm = dtm_lda, 
+                        k = 3, 
+                        iterations = 5000,
+                        burnin = 4000, 
+                        calc_coherence = T
+                        )
+```
+
+
+```{r}
+lda_trustscales$theta %>% 
+   head() %>% 
+   as.data.frame() %>% 
+   set_names(paste("Topic", 1:3)) %>% 
+   rownames_to_column("document")  
+```
+```{r}
+trust_word_topic <- GetTopTerms(lda_trustscales$phi, 30) %>% 
+   as.data.frame() %>% 
+   set_names(paste("Topic", 1:3))
+
+trust_word_topic
+```
+
+
+```{r}
+trust_word_topic %>% 
+   rownames_to_column("id") %>%
+   mutate(id = as.numeric(id)) %>% 
+   pivot_longer(-id, names_to = "topic", values_to = "term") %>% 
+   ggplot(aes(label = term, size = rev(id), color = topic, alpha = rev(id))) +
+   geom_text_wordcloud(seed = 123) +
+   facet_wrap(~topic, scales = "free") +
+   scale_alpha_continuous(range = c(0.4, 1)) +
+   # scale_fill_brewer(palette="Dark2",name = "Category", labels = c("Automation", "E-Commerce", "Humans"))+
+
+   scale_color_brewer(palette="Dark2") +
+   theme_minimal() +
+   theme(strip.background = element_rect(fill = "white", color = "white"),
+         strip.text.x = element_text(colour = "black"))
+```
+
+```{r}
+trust_doc_topic <- lda_trustscales$theta %>% 
+   as.data.frame() %>% 
+   rownames_to_column("id") 
+
+
+```
+
+
+```{r}
+trust_doc_topic = trust_doc_topic %>% mutate(x=gsub(".*?\\((.*?)\\).*", "\\1", id)) %>% mutate(year = gsub(",.*", "", x))
+
+trust_doc_topic %>% 
+   select(-c(id, x)) %>% 
+   #select(title, everything()) %>% 
+   pivot_longer(c(t_1, t_2, t_3), names_to = "topic", values_to = "theta") %>% 
+   mutate(topic = case_when( topic == "t_1" ~ "Automation",
+                             topic == "t_2" ~ "E-Commerce",
+                             TRUE ~ "Human-Human") %>% 
+             factor(levels = c("Automation", "E-Commerce", "Human-Human")),
+          publish_date = year
+          ) %>% 
+   group_by(year, topic) %>% 
+   summarise(theta = mean(theta)) %>% 
+   ggplot(aes(as.factor(year), theta, fill = topic, color = topic)) +
+   geom_line(aes(group = topic)) +
+   geom_point(show.legend = F) +
+   theme_minimal() +
+   theme(legend.position = "top") +
+   # scale_x_date(date_breaks = "1 weeks", 
+   #              labels = date_format(format = "%d\n%b")) +
+   # scale_y_continuous() +
+   scale_fill_manual(values = c("firebrick", "orange", "dodgerblue3")) +
+   labs(x = NULL, y = expression(theta), color = NULL, 
+        title = "Topic Proportions Over Time on Weekly Interval")
+```
+
+## Map of semantic space of trust scales
+##Each point in this space represents one scale
+```{r, plot-umap-trustscale}
+#saveRDS(scale_embedding.df, "scale_embedding.RDS")
+
+
+trust_scale.umap = umap(as.matrix(scale_embedding.df %>% select(contains("V"))), n_neighbors=8,min_dist=.3, custom.config)
+
+trust_scale.umap.df = cbind(scale_embedding.df %>% select(everything(), -contains("V")), as_tibble(trust_scale.umap$layout)) %>% 
+  distinct(paper, .keep_all = TRUE)
+
+
+trust_scale.umap.df = inner_join(trust_scale.umap.df, trustscale.df) %>% group_by(author_date) %>% slice(1)
+
+
+## Plot comments in UMAP space
+scale_umap.plot = ggplot(trust_scale.umap.df) +
+  geom_point_interactive(aes(V1, V2, fill = scale_category, tooltip = paper), size = 2, shape = 21) +
+  geom_text_repel(aes(V1, V2, label = author_date),point.padding = .1, size = 3, segment.alpha = .6) +
+ # theme_bw()
+  theme_void()
+
+tooltip_css <- "background-color:white;font-style:bold;padding:10px;border-radius:20px 20px 10px 20px"
+ggiraph(code = print(scale_umap.plot), tooltip_extra_css = tooltip_css, tooltip_opacity = .9)
+
+#ggsave(filename= "scale_umap.plot.jpeg", plot = scale_umap.plot,  width = 7, height = 8, units = "in", dpi=400)
+
+
+```
+
+## Plot the scales, create clusters
+```{r}
+## crete clusters
+#trust_scale.umap.2.df = trust_scale.umap.df %>%  mutate(Cluster = ifelse((V2>1 ), "1", ifelse((V2 > -2.39 & V2 < -0.5 & V1< 0.85), "2", ifelse((V2 <-0.5 & V1 >0), "3", NA))))
+                                                        
+trust_scale.umap.2.df = trust_scale.umap.df %>%  mutate(Cluster = ifelse((V2 > -2.39 & V2 < -.4 & V1< 0.85), "1", NA))
+trust_scale.umap.2.df = trust_scale.umap.2.df %>%  mutate(Cluster = ifelse((is.na(Cluster) & V2> -.3), "2", Cluster))
+trust_scale.umap.2.df = trust_scale.umap.2.df %>%  mutate(Cluster = ifelse((is.na(Cluster) & V1 > 0 & V2< -.4), "3", Cluster))
+
+
+trust_scale.umap.2.df = merge(trust_scale.umap.2.df, trustscale.df) %>% select("V1", "V2", "Cluster", "scale_category", "author_date") %>% distinct()
+
+trust_scale.umap.2.df$author_date = ifelse(trust_scale.umap.2.df$author_date == "Holthausen, Wintersberger, Walker & Riener (2020,September)", "Holthausen, Wintersberger, Walker & Riener (2020)",trust_scale.umap.2.df$author_date )
+  
+    trust_scale.umap.2.df$author_date = ifelse(trust_scale.umap.2.df$author_date == "Byrne & Marín (2018,June)", "Byrne & Marín (2018)",trust_scale.umap.2.df$author_date )
+    
+ 
+## Plot scales in UMAP space
+scale_umap.plot.2 = ggplot(trust_scale.umap.2.df) +
+
+  #geom_encircle(aes(V1, V2, group = Cluster), fill = "grey95", alpha = .7)+
+ #geom_mark_rect(aes(V1, V2, group = Cluster), fill = "light grey", color = "grey",label.margin = margin(2,2, 2,2, "mm"),label.buffer = unit(4, 'mm'),
+ #label.minwidth = unit(15, "mm"), label.hjust = 0,
+ #label.fontsize = (8), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = 1)+
+
+ #geom_encircle(aes(V1, V2, group = Cluster, label = Cluster), fill = "grey95", alpha = .7, s_shape=1, expand=0.025, spread = 0)+
+  geom_point(aes(V1, V2, fill = scale_category), alpha = .7, size = 3, shape = 21) +
+  scale_fill_brewer(palette="Dark2",name = "Category", labels = c("Automation", "E-Commerce", "Humans"))+
+  geom_text_repel(aes(V1, V2, label = author_date),point.padding = 1.5, size = 2.5, segment.alpha = .6) +
+  #   geom_label( 
+  #   data=trust_scale.umap.2.df %>% filter(Cluster == 1),
+  #   aes(x = 5.2, y = 6.2, label=Cluster)
+  # )+
+  # geom_label( 
+  #   data=trust_scale.umap.2.df %>% filter(Cluster == 2),
+  #   aes(x = -1.5, y = 0, label=Cluster)
+  # )+
+  #  geom_label( 
+  #   data=trust_scale.umap.2.df %>% filter(Cluster == 3),
+  #   aes(x = -5.5, y = -4.4, label=Cluster)
+  # )+
+ theme_void()+
+#theme_bw()+
+  theme(legend.position = "bottom", legend.box = "horizontal") 
+
+
+#scale_umap.plot.2 = scale_umap.plot.2+ theme(legend.title =  element_blank())
+scale_umap.plot.2
+#scale_umap.plot.2 = scale_umap.plot.2+ theme(legend.position = "top", legend.title =  element_blank())
+
+#ggsave(filename= "scale_umap.plot.encircler.jpeg", device = "jpeg", plot = scale_umap.plot.2,  width = 10, height = 8, units = "in", dpi=400)
+
+#ggsave(filename= "scale_umap.plot.2N_updatedte.jpeg", device = "jpeg", plot = scale_umap.plot.2,  width =8, height = 10, units = "in", dpi=400)
+#ggsave(filename= "scale_umap.plot.2N_052023.jpeg", device = "jpeg", bg="white", plot = scale_umap.plot.2,  width =10, height = 8, units = "in", dpi=400)
+
+#library(xlsx)
+#write.xlsx(trust_scale.umap.2.df, "trust_scale.umap.2.df.xlsx")
+
+```
+
+
+## Calculate centroid for questionnaires
+```{r}
+questionnaire_distance = trust_scale.umap.2.df %>% ungroup() %>% mutate(V1_mu = mean(V1), V2_mu = mean(V2))
+questionnaire_distance = questionnaire_distance %>% ungroup() %>% mutate(Sv1_i = (V1 - V1_mu)^2, Sv2_i = (V2 - V2_mu)^2)
+questionnaire_distance = questionnaire_distance %>% ungroup() %>% mutate(S_i = Sv1_i + Sv2_i)
+
+
+
+
+ ggplot(questionnaire_distance) +
+
+  #geom_encircle(aes(V1, V2, group = Cluster), fill = "grey95", alpha = .7)+
+  geom_mark_rect(aes(V1, V2, group = Cluster), fill = "light grey", color = "grey",label.margin = margin(8,8, 8, 8, "mm"),label.buffer = unit(4, 'mm'),
+   label.minwidth = unit(15, "mm"), label.hjust = 0,
+ label.fontsize = (8), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = 1)+
+
+  #geom_encircle(aes(V1, V2, group = Cluster, label = Cluster), fill = "grey95", alpha = .7)+
+  geom_jitter(aes(V1, V2, fill = scale_category), alpha = .7, size = 2, shape = 21) +
+  scale_fill_brewer(palette="Dark2",name = "Category", labels = c("Automation", "E-Commerce", "Humans"))+
+  geom_text_repel(aes(V1, V2, label = author_date),point.padding = .9, size = 2.5, segment.alpha = .6) + 
+  #   geom_label( 
+  #   data=trust_scale.umap.2.df %>% filter(Cluster == 1),
+  #   aes(x = 5.2, y = 6.2, label=Cluster)
+  # )+
+  # geom_label( 
+  #   data=trust_scale.umap.2.df %>% filter(Cluster == 2),
+  #   aes(x = -1.5, y = 0, label=Cluster)
+  # )+
+  #  geom_label( 
+  #   data=trust_scale.umap.2.df %>% filter(Cluster == 3),
+  #   aes(x = -5.5, y = -4.4, label=Cluster)
+  # )+
+  theme_void()+
+  theme(legend.position = "bottom", legend.box = "horizontal") 
+
+```
+
+
+## Do clustering for questionnaires
+
+```{r}
+set.seed(888)
+k1 = kmeans(scale_embedding.df[,-1], centers = 7, nstart = 2)
+library(broom)
+library(factoextra)
+fviz_cluster(k1, data = scale_embedding.df[,-1])
+```
+### add cluster infor to umap
+```{r}
+tt = cbind(trust_scale.umap.df,k1$cluster)
+
+names(tt)[16]="cluster"
+
+ggplot(tt)+
+  
+  #geom_encircle(aes(V1, V2, group = cluster), fill = "grey85", alpha = .2)+
+  geom_point(aes(V1, V2, fill = scale_category), alpha = .7, size = 3, shape = 21) +
+  scale_fill_brewer(palette="Dark2",name = "Category", labels = c("Automation", "E-Commerce", "Humans"))+
+  geom_text_repel(aes(V1, V2, label = author_date),point.padding = 1.5, size = 2.5, segment.alpha = .6) +
+  ylim(-3.5,3.5)+
+  xlim(-3,3)+
+
+ theme_void()+
+#theme_bw()+
+  theme(legend.position = "bottom", legend.box = "horizontal") 
+ 
+```
+
+```{r}
+fviz_nbclust(scale_embedding.df[,-1], kmeans, method = "wss")
+
+```
+
+```{r}
+db <- dbscan(scale_embedding.df[,-1], eps = 2, MinPts = 4)  # Adjust epsilon (eps) and MinPts as per your data
+
+# Plotting the results
+ggplot(trust_scale.umap.df, aes(V1, V2, color = factor(db$cluster))) +
+  geom_point() +
+  labs(title = "DBSCAN Clustering") +
+  theme_minimal()
+```
+
+
+## Do frequency plots for the most common terms in each cluster
+```{r}
+## For the word-level data frame, add the cluster
+## Then group by the cluster to plot the most frequent 10 terms in each cluster
+
+word_item_freq.df = merge(trustscale_word.df, trust_scale.umap.2.df, by="author_date")
+#word_item_freq.df = word_item_freq.df[,c(1,2,3,15,12,10,8)]
+
+word_item_cluster.df = word_item_freq.df %>% 
+  count(Cluster, word, sort = TRUE) %>% 
+  bind_log_odds(word, Cluster, n) 
+word_item_cluster.df = inner_join(word_item_cluster.df, glove.df, by = "word") 
+
+
+word_cluster_freq.plot = word_item_cluster.df %>% 
+    group_by(Cluster) %>%
+    top_n(10, log_odds) %>%
+    #slice(1:7) %>% 
+    ungroup %>%
+    mutate(cluster = as.factor(Cluster),
+           word = fct_reorder(word, log_odds)) %>%
+    ggplot(aes(word, log_odds, fill = Cluster)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~Cluster, scales = "free_y") +
+    coord_flip() +
+   # scale_y_continuous(expand = c(0,0)) +
+  theme_bw()+
+  labs(y = "Log odds ratio, weighted by uninformative Dirichlet prior",
+        x = NULL,
+        title = "The most specific terms in each cluster")
+word_cluster_freq.plot
+
+#ggsave(filename= "word_cluster_freq.plot.pdf", plot = word_cluster_freq.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+```
+## Frequency plot based on year:
+
+```{r}
+
+
+word_year_freq.df = word_item_freq.df %>% 
+  mutate (year = str_extract(author_date, "\\((.*?)\\)")) %>% 
+  mutate(year =  as.numeric(str_replace_all(year, "\\(|\\)", ""))) %>% 
+  mutate(decade =  cut(year, breaks = seq(1960, 2030, by = 10), labels = FALSE, include.lowest = TRUE) * 10) %>% 
+  mutate(decade = decade + 1960) %>% 
+  count(decade, word, sort = TRUE) %>% 
+  bind_log_odds(word, decade, n) 
+word_year_freq.df = inner_join(word_year_freq.df, glove.df, by = "word") 
+
+
+word_year_freq.plot = word_year_freq.df %>% 
+    group_by(decade) %>%
+    top_n(10, log_odds) %>%
+    #slice(1:7) %>% 
+    ungroup %>%
+    mutate(category = as.factor(decade),
+           word = fct_reorder(word, log_odds)) %>%
+    ggplot(aes(word, log_odds, fill = decade)) +
+    geom_col(show.legend = FALSE) +
+    # scale_fill_viridis(name = "Category", labels = c("Automation", "E-Commerce", "Humans"),discrete = T)+
+    facet_wrap(~decade, scales = "free_y") +
+    coord_flip() +
+    theme_bw()+
+    labs(y = "Log odds ratio, weighted by uninformative Dirichlet prior",
+         x = NULL)
+word_year_freq.plot
+
+```
+
+## Frequncey plot based on category:
+```{r}
+
+word_category_freq.df = word_item_freq.df %>% 
+  count(scale_category.x, word, sort = TRUE) %>% 
+  bind_log_odds(word, scale_category.x, n) 
+word_category_freq.df = inner_join(word_category_freq.df, glove.df, by = "word") 
+
+
+word_category_freq.plot = word_category_freq.df %>% 
+    group_by(scale_category.x) %>%
+    top_n(10, log_odds) %>%
+    #slice(1:7) %>% 
+    ungroup %>%
+    mutate(category = as.factor(scale_category.x),
+           word = fct_reorder(word, log_odds)) %>%
+    ggplot(aes(word, log_odds, fill = scale_category.x)) +
+    geom_col(show.legend = FALSE) +
+    scale_fill_viridis(name = "Category", labels = c("Automation", "E-Commerce", "Humans"),discrete = T)+
+    facet_wrap(~scale_category.x, scales = "free_y") +
+    coord_flip() +
+    theme_bw()+
+    labs(y = "Log odds ratio, weighted by uninformative Dirichlet prior",
+         x = NULL)
+word_category_freq.plot
+
+# ggsave(filename= "word_category_freq.plot.pdf", plot = word_category_freq.plot,  width = 8, height = 5, units = "in", dpi=400)
+
+category_to_scales.plot =
+ ggplot(data = ( word_category_freq.df %>%
+    group_by(scale_category.x) %>%
+    top_n(10, log_odds)),aes((n), log_odds)) +
+    geom_point(size = .5, alpha = .7, shape = 21)+
+    geom_text_repel(aes(label = word), size = 3, segment.alpha = .3) +
+    facet_wrap(~scale_category.x) +
+    coord_trans(x="log2")+
+    xlab("Word frequency")+
+    ylab("Log odds ratio (Specific category:All scales)")+
+    theme_bw()
+
+category_to_scales.plot
+# 
+#ggsave(filename= "category_to_scales.plot.jpeg", plot = category_to_scales.plot,  width = 8, height = 5, units = "in", dpi=400)
+```
+
+
+
+## Scatterplot for word frequencies 
+```{r}
+
+word_category_log.df = trustscale_word.df %>% 
+  count(word, scale_category, sort = TRUE) %>% 
+  bind_log_odds(word, scale_category, n) %>% 
+  ungroup() %>% 
+  mutate(tpercent = n/sum(n))
+## Save the data frame to be used in the shiny app:
+write.csv(word_category_log.df,"word_category_log.csv", row.names = FALSE)
+saveRDS(word_category_log.df, file = "word_category_log.df.rds")
+
+word_freq = 
+ggplot()+
+  geom_point( data = (word_category_log.df %>% dplyr::filter(tpercent >0.0025)%>% group_by(scale_category) %>% top_n(15)), aes(x= n, y=log_odds), size = .4, alpha = .5)+
+  geom_text_repel(data = (word_category_log.df %>% filter(tpercent >0.0025) %>% group_by(scale_category) %>% top_n(15)),aes(x= n, y=log_odds,label = word), segment.alpha = .6) +
+  facet_wrap(~scale_category) +
+  theme_bw()+
+  xlab("n")+
+  ylab("")
+  theme(legend.position = "none")
+word_freq
+#ggsave(filename= "word_freq_noppl.jpeg", device = "jpeg", plot = word_freq,  width = 11, height = 5, units = "in", dpi=400)
+
+```
+
+
+#Do word frequencies over the years:
+
+
+
+## Calculate the % of each scale.i.e(50%human, 40%automation, 10%E-commerce)
+```{r}
+
+
+
+time_percentage.df =  trustscale.df %>% select(author_date, item_category, item_id, item, scale_category) %>%
+  count(item_category, author_date, sort = TRUE) %>%group_by(author_date) %>%  
+  mutate(total_items = sum(n)) %>% ungroup() %>% group_by(author_date,item_category) %>% 
+  mutate(time_per = n/total_items)
+
+## Save the data frame to be used in the shiny app:
+#write.csv(time_percentage.df,"time_percentage.df.csv", row.names = FALSE)
+#saveRDS(time_percentage.df, file = "time_percentage.df.rds")
+
+test = spread(time_percentage.df, item_category, time_per)
+test[is.na(test)] <- 0
+
+time_percentage.df = time_percentage.df %>% ungroup() %>% mutate(item_category = fct_recode(item_category, "Dispositional" = "dispositional", "Dispositional" = "Dispositional", "History-Based" = "history-based", "History-Based" = "History-Based", "Situational" = "situational", "Situational"="Situational"))
+time_percentage.df$item_category = as.factor(time_percentage.df$item_category)
+
+# time_percentage.df=time_percentage.df %>% mutate(author_date = factor(author_date, levels = author_date[order(time_per)]))
+#time_percentage.df$author_date <- reorder(time_percentage.df$author_date, time_percentage.df$time_per)
+
+  time_percentage.df$author_date = ifelse(time_percentage.df$author_date == "Holthausen, Wintersberger, Walker & Riener (2020,September)", "Holthausen, Wintersberger, Walker & Riener (2020)",time_percentage.df$author_date )
+  
+    time_percentage.df$author_date = ifelse(time_percentage.df$author_date == "Byrne & Marín (2018,June)", "Byrne & Marín (2018)",time_percentage.df$author_date )
+    
+
+
+time_precentage.plot = ggplot(time_percentage.df %>% group_by(author_date) %>% arrange(time_per), aes(fill=factor(item_category, levels= c("Dispositional", "History-Based", "Situational")), y=(time_per), x = fct_reorder(author_date, time_per, max))) + 
+  geom_bar(position="fill", stat="identity")+
+  scale_fill_grey( )+
+  theme_minimal()+
+  theme(legend.title = element_blank())+
+  theme(axis.ticks.y = element_blank() )+
+  theme(axis.ticks.x  = element_blank() )+
+  theme(axis.text.x  = element_blank() )+
+  xlab("")+
+  ylab("")+
+  #facet_wrap(.~item_category)+
+  coord_flip()
+  #theme_minimal()
+
+
+
+time_precentage.plot
+
+ # ggsave(filename= "time_precentage.plot.jpeg", plot = time_precentage.plot,  width = 8, height = 5, units = "in", dpi=400)
+
+ #ggsave(filename= "time_precentage_updated.plot.jpeg", plot = time_precentage.plot,  width = 8, height = 5, units = "in", dpi=400)
+ # 
+```
+
+### create an order bar-plot to guide scale selection
+```{r}
+ordered.df =  trustscale.df %>% select(author_date, item_category, item_id, item, scale_category, total_items) %>%
+  count(item_category, author_date, scale_category, sort = TRUE) %>%group_by(author_date) %>%  
+  mutate(total_items = sum(n)) 
+
+ordered.df = ordered.df %>% ungroup() %>% mutate(item_category = fct_recode(item_category, "Dispositional" = "dispositional", "Dispositional" = "Dispositional", "Learned" = "history-based", "Learned" = "History-Based", "Situational" = "situational", "Situational"="Situational"))
+ordered.df$item_category = as.factor(ordered.df$item_category)
+
+  ordered.df$author_date = ifelse(ordered.df$author_date == "Holthausen, Wintersberger, Walker & Riener (2020,September)", "Holthausen, Wintersberger, Walker & Riener (2020)",ordered.df$author_date )
+  
+    ordered.df$author_date = ifelse(ordered.df$author_date == "Byrne & Marín (2018,June)", "Byrne & Marín (2018)",ordered.df$author_date )
+    
+ 
+ordered_time_plot = ggplot(ordered.df %>% group_by(author_date) %>% arrange(item_category, author_date), aes(fill=factor(item_category, levels= c("Dispositional", "Learned", "Situational")), x=fct_reorder(author_date, as.numeric(item_category, fun = max)), y = n)) + 
+  geom_bar(position="fill", stat="identity")+
+  scale_fill_grey( )+
+  facet_grid(scale_category~., scales = "free", space = "free")+
+ theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text.y = element_text(size = 8, angle = 270))+
+  theme(legend.title = element_blank())+
+  theme(axis.ticks.y = element_blank() )+
+  theme(axis.ticks.x  = element_blank() )+
+  theme(axis.text.x  = element_blank() )+
+  xlab("")+
+  ylab("")+
+  coord_flip()
+ordered_time_plot
+#ggsave(filename= "ordered_time.jpeg", plot = ordered_time_plot,  width = 8, height = 8, units = "in", dpi=400)
+
+
+```
+
+
+ 
+```{r}
+samp.data <- structure(list(fullname = c("LJ", "PR", 
+"JB", "AA", "NS", 
+"MJ", "FT", "DA", "DR", 
+"AB", "BA", "RJ", "BA2", 
+"AR", "GG", "RA", "DK", 
+"DA2", "BJ2", "BK", "HN", 
+"WA2", "AE2", "JJ2"), I = c(2L, 
+1L, 3L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 3L, 2L, 3L, 3L, 3L, 
+3L, 3L, 3L, 3L, 3L, 3L, 3L), S = c(1L, 1L, 1L, 1L, 2L, 2L, 2L, 
+2L, 2L, 2L, 2L, 3L, 2L, 3L, 2L, 2L, 2L, 3L, 2L, 3L, 2L, 3L, 3L, 
+3L), D = c(2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 
+2L, 2L, 3L, 3L, 2L, 3L, 3L, 3L, 2L, 3L, 3L), C = c(0L, 2L, 1L, 
+2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 2L, 3L, 
+2L, 3L, 3L, 3L, 3L)), .Names = c("fullname", "I", "S", "D", "C"
+), class = "data.frame", row.names = c(NA, 24L))
+```
+ 
+ 
+```{r}
+
+time_percentage.df =  trustscale.df %>% select(author_date, item_category, item_id, item) %>%
+  count(item_category, author_date, sort = TRUE) %>%group_by(author_date) %>%  
+  mutate(total_items = sum(n)) %>% ungroup() %>% group_by(author_date,item_category) %>% 
+  mutate(time_per = n/total_items)
+
+## Save the data frame to be used in the shiny app:
+#write.csv(time_percentage.df,"time_percentage.df.csv", row.names = FALSE)
+#saveRDS(time_percentage.df, file = "time_percentage.df.rds")
+
+test = spread(time_percentage.df, item_category, time_per)
+test[is.na(test)] <- 0
+
+time_percentage.df = time_percentage.df %>% ungroup() %>% mutate(item_category = fct_recode(item_category, "Dispositional" = "dispositional", "Dispositional" = "Dispositional", "History-Based" = "history-based", "History-Based" = "History-Based", "Situational" = "situational", "Situational"="Situational"))
+time_percentage.df$item_category = as.factor(time_percentage.df$item_category)
+
+
+ 
+ category_percentage.df = trustscale_word.df %>% 
+  count(word, author_date, scale_category, sort = TRUE) 
+
+category_percentage.df = inner_join(category_percentage.df,word_category_log.df[,c(1,2,4)], by=c("word"))
+
+category_percentage.df = category_percentage.df %>% group_by(word,author_date) %>% 
+  filter(log_odds == max(log_odds)) %>% ungroup() %>% group_by(author_date) %>% 
+  mutate(sum_log = sum(log_odds)) %>% ungroup() %>% group_by(author_date, scale_category.y) %>% 
+  mutate(sum_cat = sum(log_odds)) %>% mutate(cat_per = sum_cat/sum_log) %>% summarize(cat_per=max(cat_per))
+
+category_percentage.df$scale_category.y = as.factor(category_percentage.df$scale_category.y)
+ category_percentage.df$author_date = factor(category_percentage.df$author_date, levels = rev(levels(factor(category_percentage.df$author_date))))
+
+category_percentage.plot = ggplot(category_percentage.df %>% group_by(author_date) %>% arrange(scale_category.y,cat_per), aes(fill=factor(scale_category.y, levels = c("Automation", "E-Commerce","Human-Human")), y=cat_per, x=(fct_reorder(author_date, as.numeric(scale_category.y) )))) + 
+    geom_bar(position="fill", stat="identity")+
+  scale_fill_grey( )+
+  theme_minimal()+
+  theme(legend.title = element_blank())+
+  theme(axis.ticks.y = element_blank() )+
+  theme(axis.ticks.x  = element_blank() )+
+  theme(axis.text.x  = element_blank() )+
+  xlab("")+
+  ylab("")+
+  coord_flip()
+
+category_percentage.plot
+
+#ggsave(filename= "category_percentage.jpeg", plot = category_percentage.plot,  width = 8, height = 8, units = "in", dpi=400)
+
+ #ggsave(filename= "category_percentage_updated.jpeg", plot = category_percentage.plot,  width = 8, height = 5, units = "in", dpi=400)
+```
+
+##Treemap
+```{r}
+library(reshape2)
+library(pheatmap)
+library(RColorBrewer)
+tt = time_percentage.df %>% ungroup() %>% group_by(author_date, item_category) %>% summarise(time_per = sum(time_per))
+
+time_per_long = dcast(tt, author_date ~ item_category, value.var="time_per")
+
+cat_per_long =  dcast(category_percentage.df, author_date ~ scale_category.y, value.var="cat_per")
+
+treemap = merge(cat_per_long, time_per_long)
+treemap[is.na(treemap)] <- 0
+
+treemap$author_date = as.character(treemap$author_date)
+treemap$author_date = ifelse(treemap$author_date == "Holthausen, Wintersberger, Walker & Riener (2020,September)", "Holthausen, Wintersberger, Walker & Riener (2020)",treemap$author_date )
+  
+    treemap$author_date = ifelse(treemap$author_date == "Byrne & Marín (2018,June)", "Byrne & Marín (2018)",treemap$author_date )
+
+    names(treemap) [6] = "Learned"
+treemap$author_date = as.factor(treemap$author_date)
+ treemap = treemap %>% remove_rownames %>% column_to_rownames(var="author_date")
+## Unscalled
+
+mtx = as.matrix(treemap)
+mtx %>% pheatmap(color = colorRampPalette(rev(brewer.pal(n = 6, name =
+  "Greys")))(100),
+fontsize = 5,
+clustering_method = 'complete')
+
+## Scaled 
+mtx %>% 
+  pheatmap(color = colorRampPalette(rev(brewer.pal(n = 6, name =
+  "Greys")))(100),
+    scale = "column",
+    fontsize = 6,
+    clustering_method = 'complete')
+
+
+```
+
+## Compare against other 
+```{r}
+library(SnowballC)
+common_words = read.csv("most_common_english_words.csv")
+common_words = common_words[,c(2,4)]
+common_words$category = "English"
+names(common_words)[1] = "word"
+names(common_words)[2] = "n"
+
+common_words$word = as.character(common_words$word)
+common_words$word = gsub("^\\s+","",common_words$word)
+common_words$word = str_trim(common_words$word)
+common_words  = common_words[!grepl("[^[:alnum:] ]", common_words$word), ]
+common_words= common_words %>%  ungroup() %>% 
+   mutate(word = wordStem(word)) %>%
+  mutate(tpercent = n/sum(n))
+
+
+## stop words (i.e. domain specific)
+common_words = common_words %>%
+  #mutate(word = str_trim(word)) %>% 
+  dplyr::filter(!word %in% stop_words$word) %>%
+  filter(str_length(word) > 2) %>%
+  filter(!word == "robot") %>%
+  filter(!word == "gripper") %>%
+  filter(!word == "brand") %>%
+  filter(!word == "technology") %>%
+  filter(!word == "automation") %>%
+  filter(!word == "partner") %>%
+  filter(!word == "awd") %>%
+  filter(!word == "system") %>%
+  filter(!word == "user") %>%
+  filter(!word == "systems") %>%
+  filter(!word == "users") %>%
+  filter(!word == "rev") %>%
+  filter(!word == "excel") %>%
+  filter(!word == "spreadsheet") %>%
+  filter(!word == "product") %>%
+  filter(!word == "products") %>%
+  filter(!word == "tank") %>%
+  filter(!word == "professional") %>%
+  filter(!word == "professionals") %>%
+  filter(!word == "spotting") %>%
+  filter(!word == "things")
+
+common_words = common_words %>%
+  filter(!word %in% stop_words.2$stop_word)
+
+
+trust_scale_2col = word_embedding.df[,1:2]
+trust_scale_2col$category = "Trust"
+names(trust_scale_2col)[2] = "n"
+trust_scale_2col = trust_scale_2col %>% ungroup() %>% 
+  mutate(tpercent = n/sum(n))
+
+trust_and_common = rbind(trust_scale_2col,common_words)
+
+trust_and_common = trust_and_common %>% 
+  bind_log_odds(word, category, n) %>% 
+  ungroup()
+
+
+trust_and_common =trust_and_common %>% 
+  filter(word %in% trust_scale_2col$word)
+
+category_log.df = word_category_log.df %>% 
+    group_by(scale_category) %>%
+    top_n(10, log_odds) %>%
+    ungroup ()
+
+category_log.df = category_log.df[1:30,]
+category_log.df = merge(category_log.df, trust_and_common, by="word", all.x = T)
+category_log.df = category_log.df %>% filter(category == "Trust")
+
+English_vs_trust.plot = ggplot()+
+    geom_hline (yintercept = 0, size = 1, alpha = .4, linetype = 2)+
+  # geom_point( data = (trust_and_common %>% filter(category=="Trust")), aes(x= n, y=log_odds), size = .4, alpha = .5)+
+  # geom_jitter( data = (trust_and_common %>% filter((tpercent <0.003)&(category=="Trust"))),aes(x= n, y=log_odds),color="grey", size = 1, alpha = .8)+
+  # geom_point( data = (category_log.df), aes(x= n.y, y=log_odds.y, shape=scale_category), size = 3, alpha = .2)+
+  geom_point(data = (trust_and_common %>% filter((tpercent >0.003)&category=="Trust")), aes(x= (n), y=log_odds), shape = 21, size = .4, alpha = .5)+
+    geom_point(data = (trust_and_common %>% filter((tpercent < 0.003)&category=="Trust")), aes(x= (n), y=log_odds), shape = 21, size = .2, alpha = .2)+
+  geom_text_repel(data = (trust_and_common %>% filter((tpercent >0.003)&(category=="Trust"))),aes(x= (n), y=log_odds,label = word), size=2.8, segment.alpha = .3) +
+  geom_text_repel(data = (trust_and_common %>% filter((tpercent < 0.003)&(category=="Trust")) %>% group_by(n) %>%  sample_n(4)),aes(x= (n), y=log_odds,label = word), size=2.5, segment.alpha = .3) +
+  theme_bw()+
+  theme(legend.position = "none")+
+  coord_trans(x="log2")+
+  xlab("Word frequency")+
+  ylab("Log odds ratio (Scales' wrords:Most common English words)")
+  
+English_vs_trust.plot
+
+  # ggsave(filename= "English_vs_trust.plot.jpeg", device="jpeg", plot = English_vs_trust.plot,  width = 8, height = 6, units = "in", dpi=400)
+  # 
+  #   ggsave(filename= "English_vs_trust_updated.plot.jpeg", device="jpeg", plot = English_vs_trust.plot,  width = 8, height = 6, units = "in", dpi=400)
+
+
+```
+##
+```{r}
+
+```
+
+
+## Create a lexicon for each catergory. Calculate the closest three word for each one of those.
+```{r}
+temp = trust_and_common %>% ungroup() %>% filter(category == "Trust") %>%  top_n(20, log_odds) 
+temp = temp [, c(1,2,5)]
+
+word.df = inner_join(temp, glove.df, by = "word") 
+
+word.df = as.data.frame(word.df)
+
+glv.df = glove.df
+glv.df$word = as.character(glv.df$word)
+glv.cov = cov(glove.df[,-1])
+
+glv.df$word = gsub("^\\s+","",glv.df$word)
+glv.df$word = str_trim(glv.df$word)
+glv.df  = glv.df[!grepl("[^[:alnum:] ]", glv.df$word), ]
+
+glv.df = glv.df %>%
+ # mutate(word = str_trim(word)) %>% 
+  dplyr::filter(!word %in% stop_words$word) %>%
+  mutate(word = wordStem(word)) %>%
+  filter(str_length(word) > 2) %>%
+  filter(!word == "robot") %>%
+  filter(!word == "gripper") %>%
+  filter(!word == "brand") %>%
+  filter(!word == "technology") %>%
+  filter(!word == "automation") %>%
+  filter(!word == "partner") %>%
+  filter(!word == "awd") %>%
+  filter(!word == "system") %>%
+  filter(!word == "user") %>%
+  filter(!word == "systems") %>%
+  filter(!word == "users") %>%
+  filter(!word == "rev") %>%
+  filter(!word == "excel") %>%
+  filter(!word == "spreadsheet") %>%
+  filter(!word == "product") %>%
+  filter(!word == "products") %>%
+  filter(!word == "tank") %>%
+  filter(!word == "professional") %>%
+  filter(!word == "professionals") %>%
+  filter(!word == "spotting") %>%
+  filter(!word == "things")
+
+glv.df = glv.df %>%
+  filter(!word %in% stop_words.2$stop_word)
+
+    
+mah <- function(word.df, glv.df, glv.cov, n) {
+  ## start a new df based on the length of word.df *3
+  df <- data.frame(matrix(ncol = 4, nrow = nrow(word.df)*(n-1)))
+  x <- c("word", "n", "logOdds", "neighbors")
+  colnames(df) <- x
+  x = 1
+  for (i in 1:nrow(word.df))
+    {
+    print(i)
+    df[x:(x+n-1),1] = rep( word.df[i,1], times = n)
+    df[x:(x+n-1),2] = rep( word.df[i,2], times = n)
+    df[x:(x+n-1),3] = rep( word.df[i,3], times = n)
+
+    c = glv.df %>% filter(word == word.df[i,1])
+    c = melt(c, id.vars = "word")
+    dist = mahalanobis(glv.df[,-1], c[,3], glv.cov, tol=1e-20)
+    dist = melt(dist)
+    full.df = cbind(glv.df, dist)
+    full.df = full.df %>% top_n(-n, value)
+
+    df[x:(x+n-1),4] = full.df[,1]
+
+    x = x+n
+  #print(x)
+   print(full.df[,1])
+    
+  }
+  return(df)
+}
+
+lexicon_mah.df = mah(word.df, glv.df, glv.cov, 10)
+lexicon_mah.df$distance = "mah"
+
+lexicon_mah.df = lexicon_mah.df %>% ungroup() %>% group_by(word) %>% mutate(neighbor = 1:10)
+lexicon_mah_wide.df= lexicon_mah.df %>% spread(neighbor, neighbors)
+```
+
+
+
+## Try cosine similarity
+
+```{r}
+temp = trust_and_common %>% ungroup() %>% filter(category == "Trust") %>%  top_n(20, log_odds) 
+temp = temp [, c(1,2,5)]
+
+word.df = inner_join(temp, glove.df, by = "word") 
+word.df = as.data.frame(word.df)
+
+glv.df = glove.df
+glv.df$word = as.character(glv.df$word)
+
+glv.df$word = gsub("^\\s+","",glv.df$word)
+glv.df$word = str_trim(glv.df$word)
+glv.df  = glv.df[!grepl("[^[:alnum:] ]", glv.df$word), ]
+
+glv.df = glv.df %>%
+  dplyr::filter(!word %in% stop_words$word) %>%
+  dplyr::filter(str_length(word) > 2) %>%
+  filter(!word == "robot") %>%
+  filter(!word == "gripper") %>%
+  filter(!word == "brand") %>%
+  filter(!word == "technology") %>%
+  filter(!word == "automation") %>%
+  filter(!word == "partner") %>%
+  filter(!word == "awd") %>%
+  filter(!word == "system") %>%
+  filter(!word == "user") %>%
+  filter(!word == "systems") %>%
+  filter(!word == "users") %>%
+  filter(!word == "rev") %>%
+  filter(!word == "excel") %>%
+  filter(!word == "spreadsheet") %>%
+  filter(!word == "product") %>%
+  filter(!word == "products") %>%
+  filter(!word == "tank") %>%
+  filter(!word == "professional") %>%
+  filter(!word == "professionals") %>%
+  filter(!word == "spotting") %>%
+  filter(!word == "things")
+
+glv.df = glv.df %>%
+  filter(!word %in% stop_words.2$stop_word)
+
+
+cos.dist <- function(word.df, glv.df, n) {
+  ## start a new df based on the length of word.df *3
+  df <- data.frame(matrix(ncol = 4, nrow = nrow(word.df)*(n)))
+  x <- c("word", "n", "logOdds", "neighbors")
+  colnames(df) <- x
+  x = 1
+  for (i in 1:nrow(word.df))
+    {
+    print(i)
+    df[x:(x+n-1),1] = rep( word.df[i,1], times = n)
+    df[x:(x+n-1),2] = rep( word.df[i,2], times = n)
+    df[x:(x+n-1),3] = rep( word.df[i,3], times = n)
+
+    dist = sim2(as.matrix(word.df[i,-(1:3)]),as.matrix(glv.df[,-1]), method = "cosine")
+    dist = melt(dist)
+    full.df = cbind(glv.df, dist)
+    full.df = full.df %>% top_n(n, value)
+
+    df[x:(x+n-1),4] = full.df[,1]
+
+    x = x+n
+  #print(x)
+   print(full.df[,1])
+    
+  }
+  return(df)
+}
+
+lexicon_cos.df = cos.dist(word.df, glv.df, 20)
+lexicon_cos.df$distance = "cos"
+
+lexicon_cos.df = lexicon_cos.df %>% ungroup() %>% group_by(word) %>% mutate(neighbor = 1:20)
+lexicon_cos_wide.df= lexicon_cos.df %>% spread(neighbor, neighbors)
+
+#write.csv(lexicon_cos_wide.df, "Cos_TrustLexicon.csv")
+
+```
+
+##merge the two datasets to compare
+```{r}
+merged_lexicon.df = rbind(lexicon_cos_wide.df,lexicon_mah_wide.df)
+merged_lexicon.df = merged_lexicon.df %>% arrange(word)
+write.csv(merged_lexicon.df, "TrustLexicon_new_230509.csv")
+```
+
+## Read the new, subjectively selected lexicon words
+#### THIS WAS CHANGED ON 05/09/2023 to address reviewers comments. Instead of subject data we will use the objective one. hence, subjective_lexicon will be set to = merged_lexicon.df
+```{r}
+#subjective_lexicon = read.csv("Subjective_TrustLexicon.csv")
+#subjective_lexicon = subjective_lexicon[,1:10]
+subjective_lexicon = merged_lexicon.df %>% filter(distance == "cos")
+
+
+subjective_lexicon = subjective_lexicon[,1:19]
+
+```
+
+
+
+## plot words UMAP + lexicsom
+```{r}
+## Umap the neigbors
+subjective_lexicon=subjective_lexicon[,-c(2,3,4)]
+names(subjective_lexicon)=c("word","X1","X2" ,"X3" ,"X4", "X5","X6","X7","X8", 
+                            "X9", "X10","X11","X12" ,"X13" ,"X14", "X15" )
+
+
+neigbors_words.df = melt(as.data.frame(subjective_lexicon), id="word" )
+neigbors_words.df = neigbors_words.df[,-2] %>% arrange(word)
+
+ss = neigbors_words.df %>%
+     mutate(word_stem = wordStem(word)) %>%
+     mutate(value_stem = wordStem(value))
+
+ss2 = ss %>% filter(!(value_stem==word_stem))
+
+ss2 = ss2 %>% ungroup() %>% group_by(word, value) %>%summarise()
+
+
+ss2 = ss2 %>% ungroup() %>% group_by(word) %>% top_n(5, value)
+neigbors_words.df= ss2
+names(neigbors_words.df)[1] = "original_word"
+names(neigbors_words.df)[2] = "word"
+neigbors_words.df = neigbors_words.df %>% filter(word!="")
+
+
+neigbors_words.df = inner_join(neigbors_words.df, glove.df, by = "word") 
+neigbors_words_pred.umap = predict(trust_word.umap, as.matrix(neigbors_words.df[,-c(1,2)]))
+
+neigbors_words_pred_umap.df = cbind(neigbors_words.df[,c(1,2)], neigbors_words_pred.umap)
+
+names(neigbors_words_pred_umap.df)[3] = "V1"
+names(neigbors_words_pred_umap.df)[4] = "V2"
+
+
+```
+
+```{r}
+lexicon_wrods.df = melt(as.data.frame(subjective_lexicon), id="word" )
+lexicon_wrods.df = lexicon_wrods.df[,-2] %>% arrange(word)
+names(lexicon_wrods.df)[1] = "word"
+names(lexicon_wrods.df)[2] = "neighbor"
+lexicon_wrods.df = lexicon_wrods.df %>% filter(neighbor!="")
+
+lexicon_wrods.df = inner_join(trust_word.umap.df, lexicon_wrods.df, by="word")
+
+lexicon_umap.plot = ggplot()+
+ # geom_point_interactive(aes(V1, V2, tooltip = word, size = tf), shape = 21)+
+  geom_point(data = (lexicon_wrods.df) , aes(V1, V2), color="grey", size =.5)+
+  # geom_point(data = (trust_word.umap.df %>% filter(word %in% subjective_lexicon$word)), aes(V1, V2), color="black", size =1.5, alpha=.01, color="grey")+
+  geom_point(data = (trust_word.umap.df %>% filter(word %in% subjective_lexicon$word)), aes(V1, V2), color="black", size =1, shape = 21,alpha=.3)+
+  
+  # geom_mark_rect(data = lexicon_wrods.df, aes(x=V1, y=V2, group = word , label = word), fill = "light grey", color="grey", label.margin = margin(1, 1, 1, 1, "mm"),label.buffer = unit(4, 'mm'),
+  # label.minwidth = unit(20, "mm"), label.hjust = 0,
+  # label.fontsize = (6), label.lineheight = .5, con.type = "straight", con.border = "all", con.cap = .5)+
+   # geom_text_repel(data = lexicon_wrods.df %>% group_by(word) %>% summarise(V1=mean(V1), V2=mean(V2)), aes(x=V1, y=V2, label = word), size =2.8,segment.alpha = .1) +
+  # geom_text_repel(data = lexicon_wrods.df, aes(x=V1, y=V2, label = neighbor), size =2,segment.alpha = .2) +
+geom_text_repel(data = neigbors_words_pred_umap.df %>% group_by(word) %>% filter(row_number()==1), aes(x=V1, y=V2, label = word), size =2.5,segment.alpha = .1) +
+  geom_text_repel(data = (lexicon_wrods.df %>% group_by(word) %>% summarise(V1=mean(V1), V2=mean(V2))), aes(x=V1, y=V2, label = word), alpha=.3,size =4,segment.alpha = .1) +
+  #geom_point(size = .5)+
+  scale_size(limits = c(.1, 20)) +
+  theme_void() +
+  #theme_bw()+
+  theme(legend.position = "none")
+
+lexicon_umap.plot
+ ggsave(filename= "lexicon_umap.plot.plot_230509.jpeg", device="jpeg",bg="white", plot = lexicon_umap.plot,  width = 8, height = 6, units = "in", dpi=400)
+
+
+
+```
+
+
+## Sensitivity analysis -- Tuning the hyperparameters
+
+```{r}
+#n_neighbors 6
+trust_scale.umap_6 = umap(as.matrix(scale_embedding.df %>% select(contains("V"))), n_neighbors = 6, custom.config)
+
+trust_scale.umap_6.df = cbind(scale_embedding.df %>% select(everything(), -contains("V")), as_tibble(trust_scale.umap_6$layout)) %>% 
+  distinct(word, .keep_all = TRUE)
+
+
+trust_scale.umap_6.df = inner_join(trust_scale.umap_6.df, trustscale.df) %>% group_by(author_date) %>% slice(1)
+
+
+## Plot comments in UMAP space
+scale_umap_6.plot = ggplot(trust_scale.umap_6.df) +
+  geom_point_interactive(aes(V1, V2, tooltip = paper), size = 2, shape = 21,  fill = "grey35") +
+  geom_text_repel(aes(V1, V2, label = author_date),point.padding = .1, size = 3, segment.alpha = .6) +
+  theme_void()
+
+#ggsave(filename= "scale_umap_6.plot.pdf", plot = scale_umap_6.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+
+```
+
+
+```{r}
+#n_neighbors 12
+trust_scale.umap_12 = umap(as.matrix(scale_embedding.df %>% select(contains("V"))), n_neighbors = 12, custom.config)
+
+trust_scale.umap_12.df = cbind(scale_embedding.df %>% select(everything(), -contains("V")), as_tibble(trust_scale.umap_12$layout)) %>% 
+  distinct(word, .keep_all = TRUE)
+
+
+trust_scale.umap_12.df = inner_join(trust_scale.umap_12.df, trustscale.df) %>% group_by(author_date) %>% slice(1)
+
+
+## Plot comments in UMAP space
+scale_umap_12.plot = ggplot(trust_scale.umap_12.df) +
+  geom_point_interactive(aes(V1, V2, tooltip = paper), size = 2, shape = 21,  fill = "grey35") +
+  geom_text_repel(aes(V1, V2, label = author_date),point.padding = .1, size = 3, segment.alpha = .6) +
+  theme_void()
+
+#ggsave(filename= "scale_umap_12.plot.pdf", plot = scale_umap_12.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+```
+
+## Create a plot comparing the three levels of n_neighbor
+
+```{r}
+temp_1 = trust_scale.umap.df %>% mutate(n_neighbors = "3")
+temp_2 = trust_scale.umap_6.df %>% mutate(n_neighbors = "6")
+temp_3 = trust_scale.umap_12.df %>% mutate(n_neighbors = "12")
+
+sesnitivity_scale = rbind(temp_1, temp_2, temp_3)
+rm(list = c("temp_1", "temp_2", "temp_3"))
+
+sesnitivity_scale$n_neighbors = factor(sesnitivity_scale$n_neighbors, levels = c("3","6","12"))
+
+scale_sensitivity.plot = ggplot(sesnitivity_scale)+
+  geom_point(aes(V1, V2), size = 2, shape = 21,  fill = "grey35") +
+  facet_grid(.~n_neighbors)+
+  theme_bw()
+
+#ggsave(filename= "scale_sensitivity.plot.pdf", plot = scale_sensitivity.plot,  width = 5, height = 6, units = "in", dpi=400)
+
+  
+```
+
+
+## Map of semantic space trust-related words
+This analysis shows a map of trust-related words based on the National Research Council (NRC) lexicon.
+
+```{r, plot-umap-trustlexicon}
+## Trust lexicon analysis
+# http://www.purl.com/net/lexicons 
+# Mohammad, S. M. & Turney, P. D. (2010) Emotions evoked by common words and phrases: 
+#  Using Mechanical Turk to create an emotion lexicon, 
+# In Proceeding of Workshop on Computational Approaches to Analysis and Generation of Emotion in Text, 26-34.
+
+
+nrc = read_tsv(file = "../Embedding&TrustLexicon/NRC-Emotion-Lexicon-v0.92/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt")
+
+names(nrc) = c("word", "sentiment", "value")
+nrc_trust =  nrc %>% filter(sentiment=="trust"&value==1|sentiment=="disgust"&value==1)
+
+lexi_trust_vec.df = inner_join(nrc_trust, glove.df, by = "word") %>% 
+  filter(word != "winning")
+
+trustlexi.umap = umap(as.matrix(lexi_trust_vec.df %>% select(-word, -sentiment, -value)), n_neighbors = 5, custom.config)
+
+trustlexi_umap.df = cbind(lexi_trust_vec.df %>% select(word, sentiment, value), as.data.frame(trustlexi.umap$layout))
+
+lexi_umap.plot = ggplot(trustlexi_umap.df) +
+  geom_point_interactive(aes(V1, V2, tooltip = word, colour = sentiment), size = 1, alpha = .75) +
+  geom_label_repel(data = trustlexi_umap.df %>% sample_n(25), 
+                   aes(V1, V2, color = sentiment, label = word), size = 3,
+                   show.legend = FALSE) +
+  scale_colour_manual(values = c("grey65", "tomato"))
+  theme_void()
+
+tooltip_css <- "background-color:white;font-style:bold;padding:10px;border-radius:10px 20px 10px 20px"
+ggiraph(code = print(lexi_umap.plot), tooltip_extra_css = tooltip_css, tooltip_opacity = .9)
+
+ggsave(filename= "lexi_umap.plot.pdf", plot = lexi_umap.plot,  width = 5, height = 6, units = "in", dpi=400)
+```
+
+
+
